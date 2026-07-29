@@ -1,0 +1,177 @@
+{
+  "metadata-location": "s3://sim-bucket/warehouse/accounting/tax/invoices/metadata/00003-9b1d6dd8.metadata.json",
+  "metadata": {
+    "format-version": 2,
+    "table-uuid": "9c12a76c-3c1f-4e8a-9d7d-1f7bcbb2f1a1",
+    "location": "s3://sim-bucket/warehouse/accounting/tax/invoices",
+    "last-sequence-number": 12,
+    "last-updated-ms": 1717000000000,
+    "last-column-id": 11,
+    "current-schema-id": 1,
+    "schemas": [
+      {
+        "schema-id": 0,
+        "type": "struct",
+        "fields": [
+          { "id": 1, "name": "invoice_id", "required": true, "type": "long" },
+          { "id": 2, "name": "customer_id", "required": true, "type": "long" },
+          { "id": 3, "name": "amount", "required": false, "type": "decimal(18,2)" },
+          { "id": 4, "name": "created_at", "required": false, "type": "timestamptz" }
+        ]
+      },
+      {
+        "schema-id": 1,
+        "type": "struct",
+        "identifier-field-ids": [1],
+        "fields": [
+          { "id": 1, "name": "invoice_id", "required": true, "type": "long" },
+          { "id": 2, "name": "customer_id", "required": true, "type": "long" },
+          { "id": 3, "name": "amount", "required": false, "type": "decimal(18,2)" },
+          { "id": 4, "name": "created_at", "required": false, "type": "timestamptz" },
+          {
+            "id": 6,
+            "name": "status",
+            "required": false,
+            "type": "string",
+            "doc": "Lifecycle state of the invoice."
+          },
+          {
+            "id": 7,
+            "name": "billing_address",
+            "required": false,
+            "type": {
+              "type": "struct",
+              "fields": [
+                { "id": 9, "name": "city", "required": false, "type": "string" },
+                { "id": 10, "name": "postcode", "required": false, "type": "string" }
+              ]
+            }
+          },
+          {
+            "id": 8,
+            "name": "line_item_ids",
+            "required": false,
+            "type": {
+              "type": "list",
+              "element-id": 11,
+              "element": "long",
+              "element-required": true
+            }
+          }
+        ]
+      }
+    ],
+    "default-spec-id": 0,
+    "partition-specs": [
+      {
+        "spec-id": 0,
+        "fields": [
+          {
+            "source-id": 4,
+            "field-id": 1000,
+            "name": "created_at_day",
+            "transform": "day"
+          }
+        ]
+      },
+      {
+        "spec-id": 1,
+        "fields": [
+          {
+            "source-id": 2,
+            "field-id": 1001,
+            "name": "customer_id_bucket",
+            "transform": "bucket[16]"
+          }
+        ]
+      }
+    ],
+    "last-partition-id": 1001,
+    "default-sort-order-id": 0,
+    "sort-orders": [
+      {
+        "order-id": 0,
+        "fields": [
+          {
+            "source-id": 4,
+            "transform": "identity",
+            "direction": "asc",
+            "null-order": "nulls-last"
+          }
+        ]
+      }
+    ],
+    "properties": {
+      "write.format.default": "parquet",
+      "write.parquet.compression-codec": "zstd",
+      "owner": "finance-team"
+    },
+    "current-snapshot-id": 8721340192837465000,
+    "snapshots": [
+      {
+        "snapshot-id": 8721340192837460000,
+        "parent-snapshot-id": null,
+        "sequence-number": 11,
+        "timestamp-ms": 1716900000000,
+        "manifest-list": "s3://sim-bucket/warehouse/accounting/tax/invoices/metadata/snap-8721340192837460000.avro",
+        "summary": {
+          "operation": "append",
+          "added-data-files": "40",
+          "added-records": "135000",
+          "total-records": "135000",
+          "total-data-files": "40"
+        },
+        "schema-id": 0
+      },
+      {
+        "snapshot-id": 8721340192837465000,
+        "parent-snapshot-id": 8721340192837460000,
+        "sequence-number": 12,
+        "timestamp-ms": 1717000000000,
+        "manifest-list": "s3://sim-bucket/warehouse/accounting/tax/invoices/metadata/snap-8721340192837465000.avro",
+        "summary": {
+          "operation": "append",
+          "added-data-files": "4",
+          "added-records": "15000",
+          "added-files-size": "2048000",
+          "changed-partition-count": "3",
+          "total-records": "150000",
+          "total-data-files": "40"
+        },
+        "schema-id": 1
+      },
+      {
+        "snapshot-id": 8721340192837470000,
+        "parent-snapshot-id": 8721340192837465000,
+        "sequence-number": 13,
+        "timestamp-ms": 4070908800000,
+        "manifest-list": "s3://sim-bucket/warehouse/accounting/tax/invoices/metadata/snap-8721340192837470000.avro",
+        "summary": {
+          "operation": "append",
+          "added-data-files": "1",
+          "added-records": "10",
+          "total-records": "150010",
+          "total-data-files": "41"
+        },
+        "schema-id": 1
+      }
+    ],
+    "snapshot-log": [
+      { "timestamp-ms": 1716900000000, "snapshot-id": 8721340192837460000 },
+      { "timestamp-ms": 1717000000000, "snapshot-id": 8721340192837465000 }
+    ],
+    "metadata-log": [
+      {
+        "timestamp-ms": 1716900000000,
+        "metadata-file": "s3://sim-bucket/warehouse/accounting/tax/invoices/metadata/00002-2b0a1f9c.metadata.json"
+      }
+    ],
+    "refs": {
+      "main": { "snapshot-id": 8721340192837465000, "type": "branch" },
+      "eom-2024-05": { "snapshot-id": 8721340192837460000, "type": "tag" }
+    }
+  },
+  "config": {
+    "client.region": "us-east-1"
+  }
+}

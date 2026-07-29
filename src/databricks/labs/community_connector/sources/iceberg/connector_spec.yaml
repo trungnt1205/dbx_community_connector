@@ -1,0 +1,208 @@
+# Iceberg (REST Catalog) Community Connector Spec
+# Connection-level options live here; table-level options must appear in
+# external_options_allowlist so the pipeline can pass them through.
+
+display_name: Iceberg (REST Catalog)
+connection:
+  auth_methods:
+    - name: bearer_token
+      description: >
+        Static bearer token authentication. Works with most REST Catalog
+        implementations (Databricks Unity Catalog, Tabular, Polaris, etc.).
+      parameters:
+        - name: token
+          type: string
+          required: true
+          secret: true
+          description: >
+            Bearer access token for the REST Catalog. Long-lived PAT-style
+            token issued out-of-band by the catalog operator.
+
+    - name: oauth2
+      description: >
+        OAuth 2.0 client credentials. The connector exchanges client_id and
+        client_secret for an access token at the catalog's token endpoint
+        (default {uri}/v1/oauth/tokens unless overridden by the server or
+        oauth2_server_uri).
+      parameters:
+        - name: credential
+          type: string
+          required: false
+          secret: true
+          description: >
+            OAuth2 client credentials in the format client_id:client_secret.
+            Alternative to supplying client_id and client_secret separately.
+        - name: client_id
+          type: string
+          required: false
+          secret: true
+          description: >
+            OAuth2 client ID. Use with client_secret as an alternative to
+            the credential parameter.
+        - name: client_secret
+          type: string
+          required: false
+          secret: true
+          description: >
+            OAuth2 client secret. Use with client_id as an alternative to
+            the credential parameter.
+        - name: scope
+          type: string
+          required: false
+          description: >
+            OAuth2 scope requested from the token endpoint (default "catalog").
+        - name: oauth2_server_uri
+          type: string
+          required: false
+          description: >
+            External OAuth2 token endpoint URL. Defaults to {uri}/v1/oauth/tokens.
+            Omit when the catalog is also the token provider; supply when the
+            server references an external identity provider (e.g. Keycloak).
+            Also accepts underscore variant oauth2-server-uri.
+
+  parameters:
+    - name: uri
+      type: string
+      required: true
+      description: >
+        REST Catalog root URL, e.g. https://catalog.example.com/iceberg.
+        The bootstrap GET /v1/config call is made here and all subsequent
+        catalog routes are relative to this URI.
+
+    - name: warehouse
+      type: string
+      required: false
+      description: >
+        Warehouse name or URI sent as the ?warehouse= query parameter on
+        /v1/config. Lets a multi-warehouse catalog server scope the session
+        to a specific storage location or tenant. Omit for single-warehouse
+        catalogs.
+
+    - name: prefix
+      type: string
+      required: false
+      description: >
+        Catalog path prefix for all resource paths (resolved from /v1/config
+        defaults/overrides if not set here). Omit to use the server's default.
+
+    - name: vended_credentials
+      type: string
+      required: false
+      description: >
+        When "true", request X-Iceberg-Access-Delegation: vended-credentials
+        header on table load requests, asking the server to include short-lived
+        storage credentials in the response. Default "false". Useful when the
+        connector does not have long-lived cloud credentials of its own.
+
+    - name: page_size
+      type: string
+      required: false
+      description: >
+        Hint for pagination page size on list endpoints (?pageSize=).
+        Server may cap or ignore. Default 100.
+
+    - name: timeout
+      type: string
+      required: false
+      description: >
+        Per-request timeout in seconds. Default 60. Increase for slow
+        networks or very large catalogs.
+
+    - name: catalog_name
+      type: string
+      required: false
+      description: >
+        Logical catalog name passed to pyiceberg's RestCatalog
+        (default "iceberg"). Used only when reading table row data.
+
+    - name: data_tables
+      type: string
+      required: false
+      description: >
+        Comma-separated list of Iceberg tables to read row data from,
+        as dotted identifiers (namespace.table) or explicit aliases
+        (alias=namespace.table). By default, only metadata streams
+        (namespaces, tables, table_schemas, etc.) are exposed; set
+        this to add one stream per configured table. Empty by default.
+
+    - name: rest.sigv4-enabled
+      type: string
+      required: false
+      description: >
+        AWS SigV4 request signing for REST Catalog calls
+        (e.g. AWS Glue Iceberg REST endpoint). Set to "true" and supply
+        rest.signing-region and optionally rest.signing-name. Passed
+        through to pyiceberg's RestCatalog.
+
+    - name: rest.signing-region
+      type: string
+      required: false
+      description: >
+        AWS region for SigV4 signing (e.g. "us-east-1"). Passed through
+        to pyiceberg's RestCatalog when rest.sigv4-enabled is "true".
+
+    - name: rest.signing-name
+      type: string
+      required: false
+      description: >
+        AWS service name for SigV4 signing (e.g. "glue" or "execute-api").
+        Passed through to pyiceberg's RestCatalog when rest.sigv4-enabled
+        is "true".
+
+    - name: s3.access-key-id
+      type: string
+      required: false
+      secret: true
+      description: >
+        S3 access key ID for storage credential handling. Passed through
+        to pyiceberg for data-file access when the catalog does not vend
+        credentials. Also applies to s3.secret-access-key, s3.session-token,
+        s3.region, and other s3.* properties.
+
+    - name: gcs.project-id
+      type: string
+      required: false
+      description: >
+        Google Cloud project ID for GCS storage access. Passed through
+        to pyiceberg for data-file access. Also applies to other gcs.*
+        properties.
+
+    - name: adls.account-name
+      type: string
+      required: false
+      description: >
+        Azure Data Lake Storage account name. Passed through to pyiceberg
+        for data-file access. Also applies to other adls.*, adlfs.*,
+        and azure.* properties.
+
+    - name: hdfs.default-fs
+      type: string
+      required: false
+      description: >
+        HDFS default filesystem URI. Passed through to pyiceberg for
+        data-file access. Also applies to other hdfs.* properties.
+
+    - name: client.http-client-class
+      type: string
+      required: false
+      description: >
+        Custom HTTP client class name for storage access. Passed through
+        to pyiceberg. Also applies to other client.* properties.
+
+    - name: header.custom-header-name
+      type: string
+      required: false
+      description: >
+        Custom request headers for storage access (prefix header.). Passed
+        through to pyiceberg for data-file requests.
+
+    - name: py-io-impl
+      type: string
+      required: false
+      description: >
+        Python FileIO implementation class for storage access. Passed
+        through to pyiceberg's RestCatalog.
+
+# Per-table options the pipeline may pass through.
+# These control streaming behavior, metadata filtering, and data-read parameters.
+external_options_allowlist: "max_objects_per_batch,max_records_per_batch,max_namespace_depth,include_namespace_properties,incremental_column,row_filter,selected_fields"

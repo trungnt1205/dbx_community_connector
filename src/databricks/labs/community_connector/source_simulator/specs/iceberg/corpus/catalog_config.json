@@ -1,0 +1,16 @@
+{
+  "overrides": {
+    "prefix": "sim_catalog",
+    "warehouse": "s3://sim-bucket/warehouse"
+  },
+  "defaults": {
+    "clients": "4",
+    "namespace-separator": "\u001f"
+  },
+  "endpoints": [
+    "GET /v1/{prefix}/namespaces",
+    "GET /v1/{prefix}/namespaces/{namespace}",
+    "GET /v1/{prefix}/namespaces/{namespace}/tables",
+    "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}"
+  ]
+}

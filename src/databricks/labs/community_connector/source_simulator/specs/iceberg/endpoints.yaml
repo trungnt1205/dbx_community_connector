@@ -1,0 +1,232 @@
+# Apache Iceberg REST Catalog (open spec) — endpoints the connector exercises.
+#
+# Connector flow (see sources/iceberg/iceberg_rest.py):
+#
+#   1. GET  {uri}/v1/config?warehouse=...            bootstrap; the response's
+#                                                    `overrides.prefix` is used
+#                                                    in every subsequent path.
+#   2. POST {uri}/v1/oauth/tokens                    only when the connector is
+#                                                    configured with
+#                                                    `credential` instead of a
+#                                                    static `token`.
+#   3. GET  {uri}/v1/{prefix}/namespaces             recursive walk via
+#                                                    `?parent=<levels joined
+#                                                    with 0x1F>`.
+#   4. GET  {uri}/v1/{prefix}/namespaces/{ns}        namespace properties.
+#   5. GET  {uri}/v1/{prefix}/namespaces/{ns}/tables table identifiers.
+#   6. GET  {uri}/v1/{prefix}/namespaces/{ns}/tables/{table}
+#                                                    the full LoadTableResult,
+#                                                    flattened by the connector
+#                                                    into table_schemas /
+#                                                    table_snapshots /
+#                                                    table_partition_specs /
+#                                                    table_properties.
+#
+# Path variants
+# -------------
+# `uri` is operator-supplied, so the catalog root may sit under a base path
+# (`https://host/iceberg`, `https://host/api/2.1/unity-catalog/iceberg`, …).
+# The spec's path patterns are anchored, and each `{placeholder}` matches
+# exactly one segment, so every route is declared three times: with zero, one
+# and two leading base segments. Simulate-mode tests should use a `uri` with
+# at most two path segments, e.g.
+#
+#     uri: https://iceberg.example.test/iceberg
+#
+# Add another `{base_pN}` variant here if a deployment needs a deeper root.
+#
+# `{prefix}` is always present because `corpus/catalog_config.json` returns
+# `overrides.prefix: sim_catalog`, which the connector must honour per the
+# spec's merge rules (server overrides always win).
+#
+# Corpus notes
+# ------------
+# * `catalog_config`, `oauth_token`, `namespace_properties` and `load_table`
+#   are single-entity documents; `table_identifiers` is a record array;
+#   `namespace_levels` feeds the namespace handler. None of these names
+#   collide with the connector's TABLE_SCHEMAS keys, so regenerating the
+#   corpus with `tools.corpus_from_schema` leaves them intact.
+# * `load_table` is served for every table. The connector stamps each derived
+#   row with the *requested* namespace/table, so primary keys stay unique
+#   across the catalog.
+# * `synthesize_future_records:` cannot be used here — it only augments list
+#   corpora, and the cursor for `table_snapshots` lives inside a single-entity
+#   document. Instead `load_table.json` carries a hard-coded year-2099
+#   snapshot (`timestamp-ms: 4070908800000`). A connector that correctly caps
+#   its offset at init time must exclude it; one that leaks it fails the
+#   termination/cap assertions.
+#
+# Pagination
+# ----------
+# The list routes use opaque `pageToken` / `pageSize` with a `next-page-token`
+# in the body. That is not one of the built-in pagination styles, so:
+#   * `namespaces` — the custom handler implements it for real (the token is
+#     the next offset), which exercises the connector's paging loop;
+#   * `tables` — served as a single page (`pagination_style: none` plus
+#     `next-page-token: null`), which is what the connector's loop expects
+#     from a small namespace.
+
+endpoints:
+  # ---------------------------------------------------------------- config --
+  - path: "/v1/config"
+    method: GET
+    corpus: catalog_config
+    response:
+      single_entity: true
+      pagination_style: none
+    params:
+      warehouse: {role: ignore}
+
+  - path: "/{base_p1}/v1/config"
+    method: GET
+    corpus: catalog_config
+    response:
+      single_entity: true
+      pagination_style: none
+    params:
+      warehouse: {role: ignore}
+
+  - path: "/{base_p1}/{base_p2}/v1/config"
+    method: GET
+    corpus: catalog_config
+    response:
+      single_entity: true
+      pagination_style: none
+    params:
+      warehouse: {role: ignore}
+
+  # ----------------------------------------------- OAuth2 client credentials --
+  # Form-encoded body (grant_type/client_id/client_secret/scope); the simulator
+  # never validates credentials, it just issues a stub bearer token.
+  - path: "/v1/oauth/tokens"
+    method: POST
+    corpus: oauth_token
+    response:
+      single_entity: true
+      pagination_style: none
+
+  - path: "/{base_p1}/v1/oauth/tokens"
+    method: POST
+    corpus: oauth_token
+    response:
+      single_entity: true
+      pagination_style: none
+
+  - path: "/{base_p1}/{base_p2}/v1/oauth/tokens"
+    method: POST
+    corpus: oauth_token
+    response:
+      single_entity: true
+      pagination_style: none
+
+  # ------------------------------------------------------- list namespaces --
+  # Handler-backed: the response is an array of level-arrays and `parent` is a
+  # hierarchy query, neither of which the declarative pipeline can express.
+  # Query params handled inside the handler: parent, pageToken, pageSize.
+  - path: "/v1/{prefix}/namespaces"
+    method: GET
+    corpus: namespace_levels
+    handler: databricks.labs.community_connector.source_simulator.specs.iceberg.handlers.catalog:list_namespaces
+
+  - path: "/{base_p1}/v1/{prefix}/namespaces"
+    method: GET
+    corpus: namespace_levels
+    handler: databricks.labs.community_connector.source_simulator.specs.iceberg.handlers.catalog:list_namespaces
+
+  - path: "/{base_p1}/{base_p2}/v1/{prefix}/namespaces"
+    method: GET
+    corpus: namespace_levels
+    handler: databricks.labs.community_connector.source_simulator.specs.iceberg.handlers.catalog:list_namespaces
+
+  # -------------------------------------------------------- load namespace --
+  # GetNamespaceResponse: {"namespace": [...], "properties": {...}}.
+  # The connector reads only `properties` and keeps the namespace it asked for,
+  # so one document serves every namespace.
+  - path: "/v1/{prefix}/namespaces/{namespace}"
+    method: GET
+    corpus: namespace_properties
+    response:
+      single_entity: true
+      pagination_style: none
+
+  - path: "/{base_p1}/v1/{prefix}/namespaces/{namespace}"
+    method: GET
+    corpus: namespace_properties
+    response:
+      single_entity: true
+      pagination_style: none
+
+  - path: "/{base_p1}/{base_p2}/v1/{prefix}/namespaces/{namespace}"
+    method: GET
+    corpus: namespace_properties
+    response:
+      single_entity: true
+      pagination_style: none
+
+  # ----------------------------------------------------------- list tables --
+  # ListTablesResponse: {"identifiers": [{"namespace": [...], "name": "..."}],
+  #                      "next-page-token": null}
+  - path: "/v1/{prefix}/namespaces/{namespace}/tables"
+    method: GET
+    corpus: table_identifiers
+    response:
+      pagination_style: none
+      wrapper:
+        records_key: identifiers
+        extras:
+          next-page-token: null
+    params:
+      pageToken: {role: ignore}
+      pageSize: {role: ignore}
+
+  - path: "/{base_p1}/v1/{prefix}/namespaces/{namespace}/tables"
+    method: GET
+    corpus: table_identifiers
+    response:
+      pagination_style: none
+      wrapper:
+        records_key: identifiers
+        extras:
+          next-page-token: null
+    params:
+      pageToken: {role: ignore}
+      pageSize: {role: ignore}
+
+  - path: "/{base_p1}/{base_p2}/v1/{prefix}/namespaces/{namespace}/tables"
+    method: GET
+    corpus: table_identifiers
+    response:
+      pagination_style: none
+      wrapper:
+        records_key: identifiers
+        extras:
+          next-page-token: null
+    params:
+      pageToken: {role: ignore}
+      pageSize: {role: ignore}
+
+  # ------------------------------------------------------------ load table --
+  # LoadTableResult: {"metadata-location": ..., "metadata": {...},
+  #                   "config": {...}}. No query params; the optional
+  # `X-Iceberg-Access-Delegation: vended-credentials` request header is
+  # accepted and ignored (the simulator models no storage credentials).
+  - path: "/v1/{prefix}/namespaces/{namespace}/tables/{table}"
+    method: GET
+    corpus: load_table
+    response:
+      single_entity: true
+      pagination_style: none
+
+  - path: "/{base_p1}/v1/{prefix}/namespaces/{namespace}/tables/{table}"
+    method: GET
+    corpus: load_table
+    response:
+      single_entity: true
+      pagination_style: none
+
+  - path: "/{base_p1}/{base_p2}/v1/{prefix}/namespaces/{namespace}/tables/{table}"
+    method: GET
+    corpus: load_table
+    response:
+      single_entity: true
+      pagination_style: none

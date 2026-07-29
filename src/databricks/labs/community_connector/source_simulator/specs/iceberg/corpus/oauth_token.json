@@ -1,0 +1,7 @@
+{
+  "access_token": "simulated-iceberg-access-token",
+  "token_type": "Bearer",
+  "expires_in": 3600,
+  "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
+  "scope": "catalog"
+}

@@ -1,0 +1,4 @@
+[
+  { "namespace": ["accounting", "tax"], "name": "invoices" },
+  { "namespace": ["accounting", "tax"], "name": "payments" }
+]
