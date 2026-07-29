@@ -50,6 +50,98 @@ from databricks.labs.community_connector.sources.iceberg.iceberg_schemas import 
 
 _ERROR_BODY_LIMIT = 512
 
+#: Default SigV4 service name from the Iceberg REST spec. AWS S3 Tables wants
+#: ``s3tables``; an API-Gateway-fronted catalog wants the default.
+DEFAULT_SIGNING_NAME = "execute-api"
+
+
+class SigV4Auth(requests.auth.AuthBase):
+    """Sign each request with AWS SigV4.
+
+    Signing happens on the *prepared* request so the signature covers the final
+    URL, query string, and body — signing earlier would miss the query
+    parameters ``requests`` appends from ``params``.
+
+    Credentials come from botocore's default chain (environment, shared config,
+    container/instance metadata, assumed role), so an instance profile works
+    without any key material in the connection.
+    """
+
+    def __init__(
+        self,
+        service_name: str,
+        region: str,
+        access_key: Optional[str] = None,
+        secret_key: Optional[str] = None,
+        session_token: Optional[str] = None,
+    ) -> None:
+        self._service_name = service_name
+        self._region = region
+        self._access_key = access_key
+        self._secret_key = secret_key
+        self._session_token = session_token
+        self._signer = None  # built lazily; botocore objects do not pickle
+
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        state["_signer"] = None
+        return state
+
+    def _build_signer(self):
+        try:
+            from botocore.auth import SigV4Auth as _BotoSigV4Auth
+            from botocore.credentials import Credentials
+            from botocore.session import Session as BotoSession
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise RuntimeError(
+                "SigV4 signing requires 'botocore'. Install it with "
+                "`pip install 'lakeflow-community-connectors-iceberg[sigv4]'` "
+                "or `pip install botocore`. It is preinstalled on Databricks "
+                "runtimes. Set rest.sigv4-enabled=false to use bearer-token "
+                "authentication instead."
+            ) from exc
+
+        if self._access_key and self._secret_key:
+            credentials = Credentials(
+                access_key=self._access_key,
+                secret_key=self._secret_key,
+                token=self._session_token,
+            )
+        else:
+            credentials = BotoSession().get_credentials()
+            if credentials is None:
+                raise RuntimeError(
+                    "SigV4 signing is enabled but no AWS credentials were "
+                    "found. Provide s3.access-key-id / s3.secret-access-key on "
+                    "the connection, or give the compute an instance profile "
+                    "or assumed role."
+                )
+        return _BotoSigV4Auth(credentials, self._service_name, self._region)
+
+    def __call__(self, request):
+        try:
+            from botocore.awsrequest import AWSRequest
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise RuntimeError(
+                "SigV4 signing requires 'botocore'; install it or set "
+                "rest.sigv4-enabled=false."
+            ) from exc
+
+        if self._signer is None:
+            self._signer = self._build_signer()
+
+        # Only headers that participate in the signature travel to the signer;
+        # hop-by-hop headers requests adds later would invalidate it.
+        aws_request = AWSRequest(
+            method=request.method,
+            url=request.url,
+            data=request.body,
+            headers={"Accept": request.headers.get("Accept", "application/json")},
+        )
+        self._signer.add_auth(aws_request)
+        request.headers.update(dict(aws_request.headers))
+        return request
+
 
 class IcebergRestError(RuntimeError):
     """An Iceberg REST Catalog ``ErrorModel`` response."""
@@ -122,6 +214,43 @@ class RestCatalogClient:
 
         self._timeout = _positive_int(options.get("timeout"), DEFAULT_TIMEOUT)
         self._page_size = _positive_int(options.get("page_size"), DEFAULT_PAGE_SIZE)
+
+        # -- SigV4 (AWS S3 Tables, Glue's REST front door, API Gateway) ------
+        # These same options are forwarded to pyiceberg for the row-data path;
+        # honouring them here is what makes the metadata streams work too.
+        self._sigv4_enabled = str(
+            options.get("rest.sigv4-enabled")
+            or options.get("rest.sigv4_enabled")
+            or "false"
+        ).lower() in ("1", "true", "yes")
+        self._signing_name = (
+            options.get("rest.signing-name")
+            or options.get("rest.signing_name")
+            or DEFAULT_SIGNING_NAME
+        )
+        self._signing_region = (
+            options.get("rest.signing-region")
+            or options.get("rest.signing_region")
+            or options.get("s3.region")
+            or options.get("aws.region")
+            or None
+        )
+        if self._sigv4_enabled and not self._signing_region:
+            raise ValueError(
+                "rest.sigv4-enabled is true but no signing region was given. "
+                "Set rest.signing-region (e.g. ap-southeast-1)."
+            )
+        self._aws_access_key = (
+            options.get("s3.access-key-id") or options.get("aws.access-key-id") or None
+        )
+        self._aws_secret_key = (
+            options.get("s3.secret-access-key")
+            or options.get("aws.secret-access-key")
+            or None
+        )
+        self._aws_session_token = (
+            options.get("s3.session-token") or options.get("aws.session-token") or None
+        )
 
         # Resolved lazily and cached; all plain values so they survive pickling.
         self._config_cache: Optional[dict] = None
@@ -223,8 +352,30 @@ class RestCatalogClient:
         return False
 
     def _auth_headers(self) -> Dict[str, str]:
+        # Under SigV4 the Authorization header is the signature, so a bearer
+        # token must not be set: it would be overwritten by the signer anyway,
+        # and asking for one would trigger a pointless OAuth exchange.
+        if self._sigv4_enabled:
+            return {}
         bearer = self._bearer()
         return {"Authorization": f"Bearer {bearer}"} if bearer else {}
+
+    @property
+    def _request_auth(self) -> Optional[requests.auth.AuthBase]:
+        """The ``requests`` auth hook, or None for bearer/anonymous calls."""
+        if not self._sigv4_enabled:
+            return None
+        auth = getattr(self, "_sigv4_auth_obj", None)
+        if auth is None:
+            auth = SigV4Auth(
+                service_name=self._signing_name,
+                region=self._signing_region,
+                access_key=self._aws_access_key,
+                secret_key=self._aws_secret_key,
+                session_token=self._aws_session_token,
+            )
+            self._sigv4_auth_obj = auth
+        return auth
 
     # -- transport --------------------------------------------------------
 
@@ -253,6 +404,7 @@ class RestCatalogClient:
                     params=params,
                     headers=request_headers,
                     timeout=self._timeout,
+                    auth=self._request_auth,
                 )
             except (requests.ConnectionError, requests.Timeout) as exc:
                 last_error = exc
@@ -348,7 +500,10 @@ class RestCatalogClient:
         parts = [self._uri, "v1"]
         prefix = self.prefix
         if prefix:
-            parts.append(quote(prefix, safe=""))
+            # The spec allows a multi-segment prefix, and real servers use one:
+            # Unity Catalog returns "catalogs/{catalog}". Percent-encoding the
+            # separator would 404 every catalog route, so "/" stays safe.
+            parts.append(quote(prefix.strip("/"), safe="/"))
         parts.extend(segments)
         return "/".join(parts)
 

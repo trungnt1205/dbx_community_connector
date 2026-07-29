@@ -129,25 +129,27 @@ connection:
       type: string
       required: false
       description: >
-        AWS SigV4 request signing for REST Catalog calls
-        (e.g. AWS Glue Iceberg REST endpoint). Set to "true" and supply
-        rest.signing-region and optionally rest.signing-name. Passed
-        through to pyiceberg's RestCatalog.
+        AWS SigV4 request signing for REST Catalog calls (AWS S3 Tables,
+        the Glue Iceberg REST endpoint, an API-Gateway-fronted catalog).
+        Set to "true" and supply rest.signing-region, plus rest.signing-name
+        when the service is not execute-api. Signs the catalog metadata calls
+        and is also passed through to pyiceberg for row-data reads. When
+        enabled, no bearer token is sent — the signature is the credential.
+        Requires botocore, which is preinstalled on Databricks runtimes.
 
     - name: rest.signing-region
       type: string
       required: false
       description: >
-        AWS region for SigV4 signing (e.g. "us-east-1"). Passed through
-        to pyiceberg's RestCatalog when rest.sigv4-enabled is "true".
+        AWS region for SigV4 signing (e.g. "ap-southeast-1"). Required when
+        rest.sigv4-enabled is "true"; falls back to s3.region / aws.region.
 
     - name: rest.signing-name
       type: string
       required: false
       description: >
-        AWS service name for SigV4 signing (e.g. "glue" or "execute-api").
-        Passed through to pyiceberg's RestCatalog when rest.sigv4-enabled
-        is "true".
+        AWS service name for SigV4 signing — "s3tables" for AWS S3 Tables,
+        "glue" for the Glue REST endpoint. Defaults to "execute-api".
 
     - name: s3.access-key-id
       type: string
@@ -205,4 +207,4 @@ connection:
 
 # Per-table options the pipeline may pass through.
 # These control streaming behavior, metadata filtering, and data-read parameters.
-external_options_allowlist: "max_objects_per_batch,max_records_per_batch,max_namespace_depth,include_namespace_properties,incremental_column,row_filter,selected_fields"
+external_options_allowlist: "max_objects_per_batch,max_records_per_batch,max_namespace_depth,include_namespace_properties,skip_unloadable_tables,incremental_column,row_filter,selected_fields"

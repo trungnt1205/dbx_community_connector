@@ -187,6 +187,86 @@ class TestAuthentication:
         assert "client_id=sim-client" in (posts[0].body or "")
         assert "scope=PRINCIPAL_ROLE%3AALL" in (posts[0].body or "")
 
+    def test_sigv4_signs_every_metadata_request(self, sent_requests):
+        """AWS S3 Tables rejects anything unsigned, including the bootstrap.
+
+        The row-data path forwards these options to pyiceberg, but the six
+        metadata streams are plain ``requests`` calls — if the client does not
+        sign them itself, every one of them 403s.
+        """
+        pytest.importorskip("botocore")
+        conn = IcebergLakeflowConnect(
+            {
+                "uri": _URI,
+                "rest.sigv4-enabled": "true",
+                "rest.signing-name": "s3tables",
+                "rest.signing-region": "ap-southeast-1",
+                "s3.access-key-id": "AKIAIOSFODNN7EXAMPLE",
+                "s3.secret-access-key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            }
+        )
+        _read_all(conn, "namespaces")
+
+        gets = [r for r in sent_requests if r.method == "GET"]
+        assert gets
+        for request in gets:
+            authorization = request.headers.get("Authorization", "")
+            assert authorization.startswith("AWS4-HMAC-SHA256 "), (
+                f"unsigned request to {request.url}"
+            )
+            assert "Credential=AKIAIOSFODNN7EXAMPLE/" in authorization
+            assert "/ap-southeast-1/s3tables/aws4_request" in authorization
+            assert "Signature=" in authorization
+            assert "X-Amz-Date" in request.headers
+
+    def test_sigv4_suppresses_the_bearer_token(self, sent_requests):
+        """A bearer header alongside a signature is dead weight at best.
+
+        It also means a catalog configured with both would burn an OAuth
+        exchange on every client for a token nothing reads.
+        """
+        pytest.importorskip("botocore")
+        conn = IcebergLakeflowConnect(
+            {
+                "uri": _URI,
+                "token": _TOKEN,
+                "rest.sigv4-enabled": "true",
+                "rest.signing-name": "s3tables",
+                "rest.signing-region": "ap-southeast-1",
+                "s3.access-key-id": "AKIAIOSFODNN7EXAMPLE",
+                "s3.secret-access-key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            }
+        )
+        _read_all(conn, "namespaces")
+        gets = [r for r in sent_requests if r.method == "GET"]
+        assert gets
+        assert not any(
+            r.headers.get("Authorization", "").startswith("Bearer") for r in gets
+        )
+
+    def test_sigv4_without_a_region_fails_fast(self):
+        """A missing region yields an unusable signature, so refuse up front."""
+        with pytest.raises(ValueError) as excinfo:
+            IcebergLakeflowConnect(
+                {"uri": _URI, "rest.sigv4-enabled": "true", "token": _TOKEN}
+            )
+        assert "rest.signing-region" in str(excinfo.value)
+
+    def test_sigv4_off_by_default_keeps_bearer_auth(self, sent_requests):
+        """The signing options must not change behaviour unless switched on."""
+        conn = IcebergLakeflowConnect(
+            {
+                "uri": _URI,
+                "token": _TOKEN,
+                "rest.signing-name": "s3tables",
+                "rest.signing-region": "ap-southeast-1",
+            }
+        )
+        _read_all(conn, "namespaces")
+        gets = [r for r in sent_requests if r.method == "GET"]
+        assert gets
+        assert all(r.headers["Authorization"] == f"Bearer {_TOKEN}" for r in gets)
+
     def test_warehouse_is_sent_on_the_config_bootstrap(self, sent_requests):
         conn = IcebergLakeflowConnect(
             {"uri": _URI, "token": _TOKEN, "warehouse": _WAREHOUSE}

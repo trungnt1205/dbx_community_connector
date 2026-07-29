@@ -60,6 +60,7 @@ Known gaps
 from __future__ import annotations
 
 import datetime as _dt
+import logging
 import re
 import uuid as _uuid
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
@@ -126,6 +127,14 @@ _COLUMN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")
 
 _FALSEY = ("0", "false", "no", "off")
 
+_LOG = logging.getLogger(__name__)
+
+#: Load-table failures that mean "this object cannot be served as an Iceberg
+#: table", rather than "the catalog is broken". A mixed catalog is the normal
+#: case — Unity Catalog answers 400 for a Delta table without Iceberg
+#: compatibility enabled — so one such table must not abort the whole crawl.
+_UNLOADABLE_STATUS_CODES = (400, 403, 404)
+
 #: Sentinel stored in ``row_offset`` once a snapshot has been fully drained.
 _DRAINED = -1
 
@@ -161,6 +170,8 @@ class IcebergLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
                                    also used to derive ``max_objects_per_batch``
     max_namespace_depth            Recursion guard for the namespace walk (default 5)
     include_namespace_properties   ``false`` skips the per-namespace ``GET`` (default true)
+    skip_unloadable_tables         ``false`` fails the stream when a table cannot be
+                                   loaded as Iceberg (400/403/404); default true skips it
     incremental_column             Data tables only — cursor column; absent means full scan
     row_filter                     Data tables only — pyiceberg row-filter expression
     selected_fields                Data tables only — comma-separated column projection
@@ -384,7 +395,26 @@ class IcebergLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
         elif kind == "table":
             levels = _decode_levels(partition["namespace"])
             name = str(partition["table"])
-            result = self._client.load_table(levels, name)
+            try:
+                result = self._client.load_table(levels, name)
+            except IcebergRestError as exc:
+                if not self._skip_unloadable(table_options):
+                    raise
+                if exc.status_code not in _UNLOADABLE_STATUS_CODES:
+                    raise
+                # The table stays visible in the `tables` stream, so the
+                # catalog inventory is still complete — only its metadata
+                # rows are missing.
+                _LOG.warning(
+                    "Skipping table '%s.%s' for stream '%s': catalog returned "
+                    "%s (%s). Set skip_unloadable_tables=false to fail instead.",
+                    NAMESPACE_DISPLAY_SEPARATOR.join(levels),
+                    name,
+                    table_name,
+                    exc.status_code,
+                    exc,
+                )
+                return
             yield from self._emit_load_table_rows(
                 table_name, levels, name, result, partition
             )
@@ -479,8 +509,12 @@ class IcebergLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
             try:
                 children = list(self._client.list_namespaces(parent))
             except IcebergRestError as exc:
-                if exc.status_code in (403, 404):
-                    # A namespace we may not read, or one removed mid-crawl.
+                # Tolerating 403/404 is right for a child namespace we may not
+                # read or that was dropped mid-crawl. On the root listing the
+                # same codes mean the catalog path itself is wrong, and
+                # swallowing them would report an empty catalog instead of a
+                # misconfiguration.
+                if parent is not None and exc.status_code in (403, 404):
                     continue
                 raise
             for levels in children:
@@ -524,6 +558,12 @@ class IcebergLakeflowConnect(LakeflowConnect, SupportsPartitionedStream):
     # ------------------------------------------------------------------
     # Row emitters
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _skip_unloadable(table_options: dict[str, str]) -> bool:
+        return str(
+            table_options.get("skip_unloadable_tables", "true")
+        ).lower() not in _FALSEY
 
     def _emit_namespaces(self, table_options: dict[str, str]) -> Iterator[dict]:
         include_properties = str(

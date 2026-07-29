@@ -53,6 +53,7 @@ from pyspark.sql.types import (
 )
 from urllib.parse import quote
 import base64
+import logging
 import random
 import requests
 import uuid as _uuid
@@ -1212,6 +1213,98 @@ def register_lakeflow_source(spark):
 
     _ERROR_BODY_LIMIT = 512
 
+    #: Default SigV4 service name from the Iceberg REST spec. AWS S3 Tables wants
+    #: ``s3tables``; an API-Gateway-fronted catalog wants the default.
+    DEFAULT_SIGNING_NAME = "execute-api"
+
+
+    class SigV4Auth(requests.auth.AuthBase):
+        """Sign each request with AWS SigV4.
+
+        Signing happens on the *prepared* request so the signature covers the final
+        URL, query string, and body — signing earlier would miss the query
+        parameters ``requests`` appends from ``params``.
+
+        Credentials come from botocore's default chain (environment, shared config,
+        container/instance metadata, assumed role), so an instance profile works
+        without any key material in the connection.
+        """
+
+        def __init__(
+            self,
+            service_name: str,
+            region: str,
+            access_key: Optional[str] = None,
+            secret_key: Optional[str] = None,
+            session_token: Optional[str] = None,
+        ) -> None:
+            self._service_name = service_name
+            self._region = region
+            self._access_key = access_key
+            self._secret_key = secret_key
+            self._session_token = session_token
+            self._signer = None  # built lazily; botocore objects do not pickle
+
+        def __getstate__(self) -> dict:
+            state = self.__dict__.copy()
+            state["_signer"] = None
+            return state
+
+        def _build_signer(self):
+            try:
+                from botocore.auth import SigV4Auth as _BotoSigV4Auth
+                from botocore.credentials import Credentials
+                from botocore.session import Session as BotoSession
+            except ImportError as exc:  # pragma: no cover - optional dependency
+                raise RuntimeError(
+                    "SigV4 signing requires 'botocore'. Install it with "
+                    "`pip install 'lakeflow-community-connectors-iceberg[sigv4]'` "
+                    "or `pip install botocore`. It is preinstalled on Databricks "
+                    "runtimes. Set rest.sigv4-enabled=false to use bearer-token "
+                    "authentication instead."
+                ) from exc
+
+            if self._access_key and self._secret_key:
+                credentials = Credentials(
+                    access_key=self._access_key,
+                    secret_key=self._secret_key,
+                    token=self._session_token,
+                )
+            else:
+                credentials = BotoSession().get_credentials()
+                if credentials is None:
+                    raise RuntimeError(
+                        "SigV4 signing is enabled but no AWS credentials were "
+                        "found. Provide s3.access-key-id / s3.secret-access-key on "
+                        "the connection, or give the compute an instance profile "
+                        "or assumed role."
+                    )
+            return _BotoSigV4Auth(credentials, self._service_name, self._region)
+
+        def __call__(self, request):
+            try:
+                from botocore.awsrequest import AWSRequest
+            except ImportError as exc:  # pragma: no cover - optional dependency
+                raise RuntimeError(
+                    "SigV4 signing requires 'botocore'; install it or set "
+                    "rest.sigv4-enabled=false."
+                ) from exc
+
+            if self._signer is None:
+                self._signer = self._build_signer()
+
+            # Only headers that participate in the signature travel to the signer;
+            # hop-by-hop headers requests adds later would invalidate it.
+            aws_request = AWSRequest(
+                method=request.method,
+                url=request.url,
+                data=request.body,
+                headers={"Accept": request.headers.get("Accept", "application/json")},
+            )
+            self._signer.add_auth(aws_request)
+            request.headers.update(dict(aws_request.headers))
+            return request
+
 
     class IcebergRestError(RuntimeError):
         """An Iceberg REST Catalog ``ErrorModel`` response."""
@@ -1284,6 +1377,43 @@ def register_lakeflow_source(spark):
 
             self._timeout = _positive_int(options.get("timeout"), DEFAULT_TIMEOUT)
             self._page_size = _positive_int(options.get("page_size"), DEFAULT_PAGE_SIZE)
+
+            # -- SigV4 (AWS S3 Tables, Glue's REST front door, API Gateway) ------
+            # These same options are forwarded to pyiceberg for the row-data path;
+            # honouring them here is what makes the metadata streams work too.
+            self._sigv4_enabled = str(
+                options.get("rest.sigv4-enabled")
+                or options.get("rest.sigv4_enabled")
+                or "false"
+            ).lower() in ("1", "true", "yes")
+            self._signing_name = (
+                options.get("rest.signing-name")
+                or options.get("rest.signing_name")
+                or DEFAULT_SIGNING_NAME
+            )
+            self._signing_region = (
+                options.get("rest.signing-region")
+                or options.get("rest.signing_region")
+                or options.get("s3.region")
+                or options.get("aws.region")
+                or None
+            )
+            if self._sigv4_enabled and not self._signing_region:
+                raise ValueError(
+                    "rest.sigv4-enabled is true but no signing region was given. "
+                    "Set rest.signing-region (e.g. ap-southeast-1)."
+                )
+            self._aws_access_key = (
+                options.get("s3.access-key-id") or options.get("aws.access-key-id") or None
+            )
+            self._aws_secret_key = (
+                options.get("s3.secret-access-key")
+                or options.get("aws.secret-access-key")
+                or None
+            )
+            self._aws_session_token = (
+                options.get("s3.session-token") or options.get("aws.session-token") or None
+            )
 
             # Resolved lazily and cached; all plain values so they survive pickling.
             self._config_cache: Optional[dict] = None
@@ -1385,8 +1515,30 @@ def register_lakeflow_source(spark):
             return False
 
         def _auth_headers(self) -> Dict[str, str]:
+            # Under SigV4 the Authorization header is the signature, so a bearer
+            # token must not be set: it would be overwritten by the signer anyway,
+            # and asking for one would trigger a pointless OAuth exchange.
+            if self._sigv4_enabled:
+                return {}
             bearer = self._bearer()
             return {"Authorization": f"Bearer {bearer}"} if bearer else {}
+
+        @property
+        def _request_auth(self) -> Optional[requests.auth.AuthBase]:
+            """The ``requests`` auth hook, or None for bearer/anonymous calls."""
+            if not self._sigv4_enabled:
+                return None
+            auth = getattr(self, "_sigv4_auth_obj", None)
+            if auth is None:
+                auth = SigV4Auth(
+                    service_name=self._signing_name,
+                    region=self._signing_region,
+                    access_key=self._aws_access_key,
+                    secret_key=self._aws_secret_key,
+                    session_token=self._aws_session_token,
+                )
+                self._sigv4_auth_obj = auth
+            return auth
 
         # -- transport --------------------------------------------------------
 
@@ -1415,6 +1567,7 @@ def register_lakeflow_source(spark):
                         params=params,
                         headers=request_headers,
                         timeout=self._timeout,
+                        auth=self._request_auth,
                     )
                 except (requests.ConnectionError, requests.Timeout) as exc:
                     last_error = exc
@@ -1510,7 +1663,10 @@ def register_lakeflow_source(spark):
             parts = [self._uri, "v1"]
             prefix = self.prefix
             if prefix:
-                parts.append(quote(prefix, safe=""))
+                # The spec allows a multi-segment prefix, and real servers use one:
+                # Unity Catalog returns "catalogs/{catalog}". Percent-encoding the
+                # separator would 404 every catalog route, so "/" stays safe.
+                parts.append(quote(prefix.strip("/"), safe="/"))
             parts.extend(segments)
             return "/".join(parts)
 
@@ -1661,6 +1817,14 @@ def register_lakeflow_source(spark):
 
     _FALSEY = ("0", "false", "no", "off")
 
+    _LOG = logging.getLogger(__name__)
+
+    #: Load-table failures that mean "this object cannot be served as an Iceberg
+    #: table", rather than "the catalog is broken". A mixed catalog is the normal
+    #: case — Unity Catalog answers 400 for a Delta table without Iceberg
+    #: compatibility enabled — so one such table must not abort the whole crawl.
+    _UNLOADABLE_STATUS_CODES = (400, 403, 404)
+
     #: Sentinel stored in ``row_offset`` once a snapshot has been fully drained.
     _DRAINED = -1
 
@@ -1696,6 +1860,8 @@ def register_lakeflow_source(spark):
                                        also used to derive ``max_objects_per_batch``
         max_namespace_depth            Recursion guard for the namespace walk (default 5)
         include_namespace_properties   ``false`` skips the per-namespace ``GET`` (default true)
+        skip_unloadable_tables         ``false`` fails the stream when a table cannot be
+                                       loaded as Iceberg (400/403/404); default true skips it
         incremental_column             Data tables only — cursor column; absent means full scan
         row_filter                     Data tables only — pyiceberg row-filter expression
         selected_fields                Data tables only — comma-separated column projection
@@ -1919,7 +2085,26 @@ def register_lakeflow_source(spark):
             elif kind == "table":
                 levels = _decode_levels(partition["namespace"])
                 name = str(partition["table"])
-                result = self._client.load_table(levels, name)
+                try:
+                    result = self._client.load_table(levels, name)
+                except IcebergRestError as exc:
+                    if not self._skip_unloadable(table_options):
+                        raise
+                    if exc.status_code not in _UNLOADABLE_STATUS_CODES:
+                        raise
+                    # The table stays visible in the `tables` stream, so the
+                    # catalog inventory is still complete — only its metadata
+                    # rows are missing.
+                    _LOG.warning(
+                        "Skipping table '%s.%s' for stream '%s': catalog returned "
+                        "%s (%s). Set skip_unloadable_tables=false to fail instead.",
+                        NAMESPACE_DISPLAY_SEPARATOR.join(levels),
+                        name,
+                        table_name,
+                        exc.status_code,
+                        exc,
+                    )
+                    return
                 yield from self._emit_load_table_rows(
                     table_name, levels, name, result, partition
                 )
@@ -2014,8 +2199,12 @@ def register_lakeflow_source(spark):
                 try:
                     children = list(self._client.list_namespaces(parent))
                 except IcebergRestError as exc:
-                    if exc.status_code in (403, 404):
-                        # A namespace we may not read, or one removed mid-crawl.
+                    # Tolerating 403/404 is right for a child namespace we may not
+                    # read or that was dropped mid-crawl. On the root listing the
+                    # same codes mean the catalog path itself is wrong, and
+                    # swallowing them would report an empty catalog instead of a
+                    # misconfiguration.
+                    if parent is not None and exc.status_code in (403, 404):
                         continue
                     raise
                 for levels in children:
@@ -2059,6 +2248,12 @@ def register_lakeflow_source(spark):
         # ------------------------------------------------------------------
         # Row emitters
         # ------------------------------------------------------------------
+
+        @staticmethod
+        def _skip_unloadable(table_options: dict[str, str]) -> bool:
+            return str(
+                table_options.get("skip_unloadable_tables", "true")
+            ).lower() not in _FALSEY
 
         def _emit_namespaces(self, table_options: dict[str, str]) -> Iterator[dict]:
             include_properties = str(

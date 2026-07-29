@@ -59,7 +59,7 @@ max_objects_per_batch,max_records_per_batch,max_namespace_depth,include_namespac
 | `catalog_name` | string | `iceberg` | Logical catalog name handed to pyiceberg. Used only on the row-data path. |
 | `data_tables` | string | – | Comma-separated list of Iceberg tables to expose as row-data streams. See [Reading table row data](#reading-table-row-data). Empty by default, so the connector exposes only the six metadata streams. |
 
-#### Storage and signing properties (row-data path only)
+#### Storage and signing properties
 
 Any option whose name starts with one of the following prefixes is passed straight through to pyiceberg's `RestCatalog`, so you can hand it storage credentials or request signing settings:
 
@@ -67,7 +67,35 @@ Any option whose name starts with one of the following prefixes is passed straig
 
 Common examples: `s3.access-key-id`, `s3.secret-access-key`, `s3.session-token`, `s3.region`, `gcs.project-id`, `adls.account-name`, `hdfs.default-fs`, `rest.sigv4-enabled`, `rest.signing-region`, `rest.signing-name`, `py-io-impl`.
 
-> **Important**: these properties affect the **row-data path only**. The six metadata streams use the connector's own HTTP client, which authenticates with a bearer token or OAuth client credentials — it does **not** perform AWS SigV4 signing. A catalog that accepts *only* SigV4 (such as the AWS Glue Iceberg REST front door) is therefore not supported for the metadata streams. Setting `s3.*` credentials is unnecessary when the catalog vends credentials (`vended_credentials=true`).
+> Storage properties (`s3.*`, `gcs.*`, `adls.*`, `hdfs.*`, `py-io-impl`) affect the **row-data path only** — the metadata streams never touch object storage. Setting them is unnecessary when the catalog vends credentials (`vended_credentials=true`).
+
+#### AWS SigV4 signing
+
+Catalogs that authenticate with AWS SigV4 rather than a bearer token — **AWS S3 Tables**, the Glue Iceberg REST endpoint, an API-Gateway-fronted catalog — are supported on **both** the metadata and row-data paths.
+
+| Option | Value |
+|---|---|
+| `rest.sigv4-enabled` | `"true"` |
+| `rest.signing-region` | Required, e.g. `ap-southeast-1`. Falls back to `s3.region` / `aws.region`. |
+| `rest.signing-name` | `s3tables` for S3 Tables, `glue` for Glue. Defaults to `execute-api`. |
+
+When signing is on, **no bearer token is sent** — the signature is the credential, so `token` / `client_id` are ignored and no OAuth exchange happens.
+
+Credentials come from botocore's default chain: an **instance profile or assumed role** on the pipeline compute, environment variables, or the shared AWS config. To pin them explicitly instead, set `s3.access-key-id` / `s3.secret-access-key` (plus `s3.session-token` for temporary credentials).
+
+Signing needs `botocore`, which is preinstalled on Databricks runtimes. Elsewhere: `pip install 'lakeflow-community-connectors-iceberg[sigv4]'`.
+
+Example for AWS S3 Tables:
+
+```json
+{
+  "uri": "https://s3tables.<region>.amazonaws.com/iceberg",
+  "warehouse": "arn:aws:s3tables:<region>:<account>:bucket/<bucket-name>",
+  "rest.sigv4-enabled": "true",
+  "rest.signing-name": "s3tables",
+  "rest.signing-region": "<region>"
+}
+```
 
 ### Obtaining the Required Parameters
 
@@ -466,7 +494,9 @@ You can also customize the source connector code for special use cases.
 - **`Data table alias ... collides with a built-in metadata stream`** — the `alias=` you chose is one of the six reserved metadata stream names (for example `tables=sales.orders`). Pick a different alias.
 - **A data table returns zero rows forever** — the Iceberg table has no snapshot yet (never written to), or the `incremental_column` watermark has already passed every row. Confirm with the `table_snapshots` stream.
 - **Storage access errors (`AccessDenied`, `NoSuchBucket`, credential errors) on data tables only** — the catalog metadata is reachable but the data files are not. Either set `vended_credentials=true` so the catalog issues short-lived storage credentials, or supply the appropriate `s3.*` / `gcs.*` / `adls.*` / `hdfs.*` properties on the connection.
-- **`AWS4-HMAC-SHA256` / signature errors on the metadata streams** — the catalog requires SigV4 request signing, which the metadata path does not implement. See the note under [Storage and signing properties](#storage-and-signing-properties-row-data-path-only).
+- **`403` / `AWS4-HMAC-SHA256` signature errors on the metadata streams** — the catalog requires SigV4 signing and it is off, or signed with the wrong service or region. Set `rest.sigv4-enabled=true` and check `rest.signing-name` (`s3tables` for AWS S3 Tables) and `rest.signing-region`. See [AWS SigV4 signing](#aws-sigv4-signing).
+- **`SigV4 signing is enabled but no AWS credentials were found`** — botocore's default chain came up empty. Give the pipeline compute an instance profile or assumed role, or set `s3.access-key-id` / `s3.secret-access-key` on the connection.
+- **`SigV4 signing requires 'botocore'`** — the compute has no botocore. It ships with Databricks runtimes; elsewhere install the `[sigv4]` extra.
 - **Timeouts loading a table** — a `LoadTableResult` for a table with a very long snapshot history can be large. Raise `timeout` (default 60 s).
 - **A metadata pipeline seems to make no progress** — remember the crawl is paced: each microbatch advances at most `max_objects_per_batch` objects. A catalog with 5,000 tables needs 100 microbatches at the default of 50. Raise the option or let the run continue.
 
@@ -476,7 +506,7 @@ You can also customize the source connector code for special use cases.
 - **No server-side incremental filter for snapshots.** `table_snapshots` fetches each table's full metadata document and applies the `timestamp_ms` window client-side, so an incremental run costs the same requests as a full one.
 - **Deferred streams.** `views`, `table_sort_orders`, and `table_refs` are not implemented. Branch and tag names are still available as the `ref_names` column on `table_snapshots`.
 - **Remote scan planning is not used.** The newer `POST .../tables/{table}/plan` server-side planning API is deferred; pyiceberg plans scans locally, which works against every REST catalog implementation.
-- **AWS SigV4 applies to the row-data path only.** The metadata streams authenticate with a bearer token or OAuth client credentials.
+- **SigV4 credentials are resolved on the compute, not by the connection.** With `rest.sigv4-enabled=true` and no explicit `s3.access-key-id`, signing relies on botocore's default chain — an instance profile or assumed role attached to the pipeline compute. A Unity Catalog connection alone cannot supply them.
 - **Nanosecond timestamps are lossy.** Iceberg v3 `timestamp_ns` / `timestamptz_ns` are narrowed to Spark's microsecond timestamps.
 - **Iceberg `time` has no Spark equivalent** and is surfaced as a string.
 - **Namespace rendering is ambiguous in one edge case.** Levels are joined with `.` in the `namespace` column, so a namespace level that itself contains a dot cannot be distinguished from two levels. The `levels` array column on the `namespaces` stream preserves the true structure.
